@@ -1,0 +1,14 @@
+DA GOTV CAR TRACKER — PRIVATE TRIAL PACK
+
+Open TRIAL-SETUP.md for step-by-step Render deployment.
+
+For tomorrow's supervised test you need:
+- Render account and private GitHub repository
+- Strong new manager password
+- 1 manager, 1 controller and 2–3 consenting drivers
+- HTTPS deployment (Render can provide a hosted URL)
+- Smartphones with mobile data and GPS enabled
+- Verified voting-station details and approved DA logo assets (optional for pilot)
+
+This is not a live hosted site yet. Deployment/account setup is required.
+GPS updates may stop while phone screens are locked.
