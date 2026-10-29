@@ -69,6 +69,40 @@ if(p==='/api/admin/issue/update'&&m==='POST'){
 if(p==='/api/logout'&&m==='POST'){let t=req.headers.authorization.slice(7),h=crypto.createHash('sha256').update(t).digest('hex');db.sessions=db.sessions.filter(x=>x.hash!==h);save();return out(r,200,{ok:true})}
 if(p==='/api/me')return out(r,200,{user:userView(u)});
 if(p==='/api/state'&&m==='GET'){let vehicles=visibleVehicles(u),campaigns=visibleCampaigns(u);return out(r,200,{user:userView(u),campaigns,vehicles:vehicles.map(vehicleView),users:['manager','superadmin'].includes(u.role)?db.users.map(userView):[],stations:db.stations,wards:db.wards,meta:db.meta,messages:db.messages.filter(msg=>['manager','superadmin'].includes(u.role)||msg.campaignId&&u.campaignIds.includes(msg.campaignId)&&(u.role==='controller'?msg.zone===u.zone||!msg.zone:msg.zone===db.vehicles.find(v=>v.driverId===u.id)?.zone||!msg.zone)).slice(-300)})}
+if(p==='/api/bulk-roster'&&m==='POST'){
+ if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager or Super Admin only');
+ let b=await body(req),rows=b.rows;
+ if(!Array.isArray(rows)||!rows.length||rows.length>500)return error(r,400,'Upload 1 to 500 roster rows');
+ const issues=[],newUsers=[],newVehicles=[],credentials=[],names=new Set(db.users.map(x=>x.username.toLowerCase())),plates=new Set(db.vehicles.map(v=>String(v.plate||'').trim().toUpperCase()).filter(Boolean));
+ const byUsername=new Map(db.users.map(x=>[x.username.toLowerCase(),x]));
+ const campaignByName=new Map(db.campaigns.map(c=>[c.name.toLowerCase(),c]));
+ rows.forEach((row,i)=>{let type=clean(row.type).toUpperCase(),n=i+2,username=clean(row.username),display=clean(row.display),role=clean(row.role).toLowerCase(),zone=clean(row.zone),campaignName=clean(row.campaign),label=clean(row.vehicle_label),plate=clean(row.plate).toUpperCase(),driverUsername=clean(row.driver_username).toLowerCase(),stationId=clean(row.station_id);
+ if(type==='PERSON'){
+  if(!['driver','controller','manager'].includes(role)){issues.push('Row '+n+': role must be driver, controller or manager');return}
+  if(!/^[a-zA-Z0-9._-]{3,40}$/.test(username)||names.has(username.toLowerCase())){issues.push('Row '+n+': username invalid or already exists');return}
+  let campaign=campaignName?campaignByName.get(campaignName.toLowerCase()):null;
+  if(campaignName&&!campaign){issues.push('Row '+n+': campaign name not found');return}
+  if(role==='controller'&&(!zone||!campaign)){issues.push('Row '+n+': controller needs zone and an existing campaign');return}
+  let password=crypto.randomBytes(18).toString('base64url');
+  let x={id:uid(),username,display:display||username,role,zone,campaignIds:campaign?[campaign.id]:[],password:hash(password),active:true};
+  names.add(username.toLowerCase());byUsername.set(username.toLowerCase(),x);newUsers.push(x);credentials.push({username,password,role});
+ }else if(type==='VEHICLE'){
+  if(!label||!plate){issues.push('Row '+n+': vehicle label and plate required');return}
+  if(plates.has(plate)){issues.push('Row '+n+': plate already exists');return}
+  let c=campaignName?campaignByName.get(campaignName.toLowerCase()):null;
+  if(campaignName&&!c){issues.push('Row '+n+': campaign not found');return}
+  if(stationId&&!db.stations.some(x=>x.id===stationId)){issues.push('Row '+n+': voting station not found');return}
+  plates.add(plate);newVehicles.push({id:uid(),label,plate,zone,driverUsername,campaignIds:c?[c.id]:[],stationId,onDuty:false,status:'Off duty',location:null,trackingEnabled:false});
+ }else issues.push('Row '+n+': type must be PERSON or VEHICLE');
+ });
+ for(const v of newVehicles){let driver=v.driverUsername?byUsername.get(v.driverUsername):null;
+  if(v.driverUsername&&(!driver||driver.role!=='driver'||!driver.active))issues.push('Vehicle '+v.label+': driver username not found or not a driver');
+  v.driverId=driver?.id||'';delete v.driverUsername;
+ }
+ if(issues.length)return out(r,400,{error:'Roster validation failed',issues:issues.slice(0,60)});
+ db.users.push(...newUsers);db.vehicles.push(...newVehicles);log('bulk_roster_import',u,{users:newUsers.length,vehicles:newVehicles.length});save();
+ return out(r,200,{users:newUsers.length,vehicles:newVehicles.length,credentials});
+}
 if(p==='/api/user'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager only');let b=await body(req),username=clean(b.username),role=clean(b.role),password=String(b.password||''),ids=Array.isArray(b.campaignIds)?b.campaignIds.filter(id=>db.campaigns.some(c=>c.id===id)):[];if(!/^[a-zA-Z0-9._-]{3,40}$/.test(username)||!ROLES.includes(role)||(role==='superadmin'&&u.role!=='superadmin')||password.length<10||db.users.some(x=>x.username.toLowerCase()===username.toLowerCase()))return error(r,400,'Unique username (3–40 chars), valid role and password (10+ chars) required');let x={id:uid(),username,display:clean(b.display)||username,role,password:hash(password),zone:clean(b.zone),campaignIds:ids,active:true};if(role==='controller'&&(!x.zone||!ids.length))return error(r,400,'Controller requires zone and campaigns');db.users.push(x);log('user_create',u,{userId:x.id,role});save();return out(r,200,{user:userView(x)})}
 if(p==='/api/user/disable'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager only');let b=await body(req),x=db.users.find(y=>y.id===b.id);if(!x||x.id===u.id||(x.role==='superadmin'&&u.role!=='superadmin'))return error(r,400,'Invalid account');x.active=false;db.sessions=db.sessions.filter(s=>s.userId!==x.id);log('user_disable',u,{userId:x.id});save();return out(r,200,{ok:true})}
 if(p==='/api/campaign'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager only');let b=await body(req),name=clean(b.name),type=clean(b.type),date=clean(b.electionDate);if(!name||!TYPES.includes(type)||!/^\d{4}-\d{2}-\d{2}$/.test(date))return error(r,400,'Name, election type and date required');let c=b.id?db.campaigns.find(x=>x.id===b.id):null;if(b.id&&!c)return error(r,404,'Campaign not found');if(!c){c={id:uid()};db.campaigns.push(c)}Object.assign(c,{name,type,electionDate:date,province:clean(b.province),municipality:clean(b.municipality),ward:clean(b.ward),status:clean(b.status)||'Planning'});if(type==='BY_ELECTION'&&(!c.municipality||!c.ward))return error(r,400,'By-election requires municipality and ward');log('campaign_save',u,{id:c.id});save();return out(r,200,{campaign:c})}
