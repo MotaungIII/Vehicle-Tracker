@@ -1,0 +1,7 @@
+
+UPLOAD TO GITHUB: keep the public folder intact.
+The root of the repository must contain server.js, package.json, render.yaml, and the public folder.
+The public folder must contain index.html, driver.html, sw.js, manifest.webmanifest, icon-192.png, icon-512.png.
+Do not upload the outer ZIP as a single file: upload the extracted contents preserving their folders.
+After commit, on Render choose Manual Deploy > Deploy latest commit if auto-deploy is disabled.
+Set GOTV_MANAGER_PASSWORD in Render Environment (minimum 12 characters). Do not commit secrets to GitHub.
