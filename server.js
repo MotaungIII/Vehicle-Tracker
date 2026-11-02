@@ -4,9 +4,9 @@ const PORT=+process.env.PORT||3000, ROOT=__dirname, FILE=path.join(process.env.G
 const BOOT_USER=process.env.GOTV_MANAGER_USER||'manager',BOOT_PASSWORD=process.env.GOTV_MANAGER_PASSWORD;
 const ROLES=['superadmin','manager','controller','driver'],TYPES=['BY_ELECTION','NPE','LGE'];
 fs.mkdirSync(path.dirname(FILE),{recursive:true});
-let db={users:[],sessions:[],campaigns:[],vehicles:[],stations:[],wards:null,messages:[],logs:[],driverLinks:[],issues:[],iecLibrary:[],meta:{}};
+let db={users:[],sessions:[],campaigns:[],vehicles:[],stations:[],wards:null,messages:[],logs:[],driverLinks:[],issues:[],iecLibrary:[],journeys:[],meta:{}};
 try{let old=JSON.parse(fs.readFileSync(FILE));db={...db,...old};}catch{}
-for(const k of ['users','sessions','campaigns','vehicles','stations','messages','logs','driverLinks','issues'])db[k]||=[];db.iecLibrary||=[];
+for(const k of ['users','sessions','campaigns','vehicles','stations','messages','logs','driverLinks','issues'])db[k]||=[];db.iecLibrary||=[];db.journeys||=[];
 function hash(p,salt=crypto.randomBytes(16).toString('hex')){return salt+':'+crypto.pbkdf2Sync(p,salt,140000,32,'sha256').toString('hex')}
 function verify(p,s){if(!s)return false;let [salt,d]=s.split(':'),v=hash(p,salt).split(':')[1];return !!d&&crypto.timingSafeEqual(Buffer.from(d,'hex'),Buffer.from(v,'hex'))}
 if(!db.users.some(u=>['manager','superadmin'].includes(u.role))){if(!BOOT_PASSWORD||BOOT_PASSWORD.length<12){console.error('Set GOTV_MANAGER_PASSWORD (at least 12 characters) to bootstrap the manager.');process.exit(1)}db.users.push({id:crypto.randomUUID(),username:BOOT_USER,display:'GOTV Manager',role:'manager',password:hash(BOOT_PASSWORD),active:true,zone:'',campaignIds:[]});}
@@ -27,6 +27,34 @@ function auth(req){let t=(req.headers.authorization||'').replace(/^Bearer /,'');
 const userView=u=>({id:u.id,username:u.username,display:u.display,role:u.role,zone:u.zone,campaignIds:u.campaignIds,active:u.active});
 const vehicleView=v=>({id:v.id,label:v.label,plate:v.plate,driverId:v.driverId,zone:v.zone,campaignIds:v.campaignIds||[],stationId:v.stationId,status:v.status,location:v.location||null,updatedAt:v.updatedAt||null,onDuty:!!v.onDuty,clockInAt:v.clockInAt||null,accuracy:v.accuracy??null,trackingEnabled:!!v.trackingEnabled});
 const allowed=(u,v)=>['manager','superadmin'].includes(u.role)||u.role==='driver'&&v.driverId===u.id||u.role==='controller'&&v.zone===u.zone&&v.campaignIds?.some(id=>u.campaignIds.includes(id));
+
+const HISTORY_DAYS=7,MAX_HISTORY_POINTS=20000;
+function recordPosition(v,driver,lat,lng,accuracy){
+ const t=now();db.journeys.push({vehicleId:v.id,driverId:driver.id,lat,lng,accuracy,time:t,shiftId:v.shiftId||null});
+ const cutoff=Date.now()-HISTORY_DAYS*86400000;
+ db.journeys=db.journeys.filter(x=>Date.parse(x.time)>=cutoff).slice(-MAX_HISTORY_POINTS);
+}
+function distanceMeters(a,b){
+ const r=Math.PI/180,dLat=(b.lat-a.lat)*r,dLon=(b.lng-a.lng)*r;
+ const h=Math.sin(dLat/2)**2+Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(dLon/2)**2;
+ return 12742000*Math.asin(Math.min(1,Math.sqrt(h)));
+}
+function journeyReport(points){
+ const stops=[],gaps=[];let start=-1,anchor=null;
+ function closeStop(end){if(start<0)return;let duration=(Date.parse(points[end].time)-Date.parse(points[start].time))/60000;
+ if(duration>=3)stops.push({start:points[start].time,end:points[end].time,durationMinutes:Math.round(duration*10)/10,lat:anchor.lat,lng:anchor.lng});
+ start=-1;anchor=null}
+ for(let i=0;i<points.length;i++){
+  if(i&&Date.parse(points[i].time)-Date.parse(points[i-1].time)>120000){
+   closeStop(i-1);gaps.push({from:points[i-1].time,to:points[i].time});start=-1;anchor=null;
+  }
+  if(points[i].accuracy>100){closeStop(i-1<0?0:i-1);continue}
+  if(start<0){start=i;anchor={lat:points[i].lat,lng:points[i].lng};continue}
+  if(distanceMeters(anchor,points[i])>50){closeStop(i-1);start=i;anchor={lat:points[i].lat,lng:points[i].lng}}
+ }
+ if(points.length)closeStop(points.length-1);
+ return {stops,gaps,method:'Estimated stationary periods: at least 3 minutes within 50 m, location accuracy <= 100 m, and no GPS gap > 2 minutes. Not proof of a physical stop.'};
+}
 const visibleCampaigns=u=>db.campaigns.filter(c=>['manager','superadmin'].includes(u.role)||u.campaignIds.includes(c.id));
 const visibleVehicles=u=>db.vehicles.filter(v=>allowed(u,v));
 const log=(kind,u,details)=>{db.logs.push({id:uid(),when:now(),kind,userId:u?.id||'',details});if(db.logs.length>10000)db.logs.splice(0,db.logs.length-10000)};
@@ -34,9 +62,9 @@ async function api(req,r,url){const p=url.pathname,m=req.method;
 if(p==='/api/login'&&m==='POST'){let b=await body(req),key=loginKey(req,clean(b.username));if(tooManyLogins(key))return error(r,429,'Too many login attempts. Try again later.');let u=db.users.find(x=>x.username.toLowerCase()===clean(b.username).toLowerCase()&&x.active);if(!u||!verify(String(b.password||''),u.password)){recordLoginFailure(key);return error(r,401,'Invalid credentials')}clearLoginFailures(key);let token=crypto.randomBytes(32).toString('hex');db.sessions.push({hash:crypto.createHash('sha256').update(token).digest('hex'),userId:u.id,expires:new Date(Date.now()+12*3600e3).toISOString()});log('login',u,{});save();return out(r,200,{token,user:userView(u)})}
 if(p.startsWith('/api/link/')){let secret=(req.headers.authorization||'').replace(/^Bearer /,''),h=crypto.createHash('sha256').update(secret).digest('hex'),link=db.driverLinks.find(x=>x.hash===h&&Date.parse(x.expires)>Date.now()),v=link&&db.vehicles.find(x=>x.id===link.vehicleId&&x.driverId===link.driverId),driver=link&&db.users.find(x=>x.id===link.driverId&&x.active&&x.role==='driver');if(!link||!v||!driver)return error(r,401,'Link expired or revoked');
 if(p==='/api/link/state'&&m==='GET')return out(r,200,{vehicle:vehicleView(v),expires:link.expires,messages:db.messages.filter(msg=>msg.zone===v.zone&&v.campaignIds.includes(msg.campaignId)).slice(-30)});
-if(p==='/api/link/clock'&&m==='POST'){let b=await body(req);if(!['in','out'].includes(b.action))return error(r,400,'Invalid action');v.onDuty=b.action==='in';v.status=v.onDuty?'On duty':'Off duty';v.clockInAt=v.onDuty?now():null;if(!v.onDuty){v.trackingEnabled=false;v.location=null;v.updatedAt=null}log('link_clock_'+b.action,driver,{vehicleId:v.id});save();return out(r,200,{vehicle:vehicleView(v)})}
+if(p==='/api/link/clock'&&m==='POST'){let b=await body(req);if(!['in','out'].includes(b.action))return error(r,400,'Invalid action');v.onDuty=b.action==='in';v.status=v.onDuty?'On duty':'Off duty';v.clockInAt=v.onDuty?now():null;if(v.onDuty)v.shiftId=uid();if(!v.onDuty){v.trackingEnabled=false;v.location=null;v.updatedAt=null}log('link_clock_'+b.action,driver,{vehicleId:v.id});save();return out(r,200,{vehicle:vehicleView(v)})}
 if(p==='/api/link/tracking'&&m==='POST'){let b=await body(req);if(!v.onDuty)return error(r,403,'Clock in first');v.trackingEnabled=b.enabled===true;if(!v.trackingEnabled){v.location=null;v.updatedAt=null}log('link_tracking_'+(v.trackingEnabled?'start':'stop'),driver,{vehicleId:v.id});save();return out(r,200,{vehicle:vehicleView(v)})}
-if(p==='/api/link/location'&&m==='POST'){if(!v.onDuty||!v.trackingEnabled)return error(r,403,'Tracking must be started');let b=await body(req),lat=Number(b.lat),lng=Number(b.lng),accuracy=Number(b.accuracy);if(!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180||!Number.isFinite(accuracy)||accuracy<0||accuracy>50000)return error(r,400,'Invalid GPS coordinates');v.location={lat,lng};v.updatedAt=now();v.accuracy=accuracy;v.status=['En route','At station','Idle','Breakdown'].includes(b.status)?b.status:'En route';save();return out(r,200,{ok:true,time:v.updatedAt})}
+if(p==='/api/link/location'&&m==='POST'){if(!v.onDuty||!v.trackingEnabled)return error(r,403,'Tracking must be started');let b=await body(req),lat=Number(b.lat),lng=Number(b.lng),accuracy=Number(b.accuracy);if(!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180||!Number.isFinite(accuracy)||accuracy<0||accuracy>50000)return error(r,400,'Invalid GPS coordinates');v.location={lat,lng};v.updatedAt=now();v.accuracy=accuracy;recordPosition(v,driver,lat,lng,accuracy);v.status=['En route','At station','Idle','Breakdown'].includes(b.status)?b.status:'En route';save();return out(r,200,{ok:true,time:v.updatedAt})}
 return error(r,404,'Unknown link operation')}
 let u=auth(req);if(!u)return error(r,401,'Please sign in');
 
@@ -71,6 +99,16 @@ if(p==='/api/admin/issue/update'&&m==='POST'){
  if(!issue||!['Open','Investigating','Resolved'].includes(b.status))return error(r,400,'Invalid issue or status');
  issue.status=b.status;issue.updatedAt=now();issue.resolvedBy=b.status==='Resolved'?u.id:null;
  log('issue_update',u,{issueId:issue.id,status:issue.status});save();return out(r,200,{issue});
+}
+if(p==='/api/journey'&&m==='GET'){
+ if(!['manager','superadmin','controller'].includes(u.role))return error(r,403,'Coordinator access required');
+ const v=db.vehicles.find(x=>x.id===url.searchParams.get('vehicleId'));
+ if(!v||!allowed(u,v))return error(r,403,'Vehicle access denied');
+ const day=url.searchParams.get('date')||now().slice(0,10);
+ if(!/^\\d{4}-\\d{2}-\\d{2}$/.test(day)||Number.isNaN(Date.parse(day+'T00:00:00Z')))return error(r,400,'Invalid date');
+ const points=db.journeys.filter(x=>x.vehicleId===v.id&&x.time.slice(0,10)===day).sort((a,b)=>a.time.localeCompare(b.time));
+ const summary=journeyReport(points);
+ return out(r,200,{vehicle:{id:v.id,label:v.label,plate:v.plate},date:day,points, ...summary,retentionDays:HISTORY_DAYS,timeZone:'UTC',sampleCount:points.length});
 }
 if(p==='/api/logout'&&m==='POST'){let t=req.headers.authorization.slice(7),h=crypto.createHash('sha256').update(t).digest('hex');db.sessions=db.sessions.filter(x=>x.hash!==h);save();return out(r,200,{ok:true})}
 if(p==='/api/me')return out(r,200,{user:userView(u)});
@@ -116,7 +154,7 @@ if(p==='/api/vehicle'&&m==='POST'){if(!['manager','superadmin'].includes(u.role)
 if(p==='/api/vehicle/force-clock-out'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager or Super Admin only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.vehicleId),reason=String(b.reason||'').trim().slice(0,300);if(!v)return error(r,404,'Vehicle not found');if(!v.onDuty&&!v.trackingEnabled)return error(r,409,'Vehicle already clocked out');if(reason.length<5)return error(r,400,'A reason of at least five characters is required');let previous={driverId:v.driverId,clockInAt:v.clockInAt,status:v.status,updatedAt:v.updatedAt};v.onDuty=false;v.trackingEnabled=false;v.status='Off duty';v.clockInAt=null;v.location=null;v.updatedAt=null;v.accuracy=null;db.driverLinks=db.driverLinks.filter(x=>x.vehicleId!==v.id);log('force_clock_out',u,{vehicleId:v.id,reason,previous});save();return out(r,200,{ok:true,vehicle:vehicleView(v)})}
 if(p==='/api/vehicle/remove'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.id);if(!v)return error(r,404,'Vehicle not found');if(b.campaignId){v.campaignIds=(v.campaignIds||[]).filter(id=>id!==b.campaignId)}else{if(v.onDuty)return error(r,409,'Clock out vehicle before deleting');db.vehicles=db.vehicles.filter(x=>x.id!==v.id)}log('vehicle_remove',u,{id:b.id,campaignId:b.campaignId||null});save();return out(r,200,{ok:true})}
 if(p==='/api/clock'&&m==='POST'){if(u.role!=='driver')return error(r,403,'Driver only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.vehicleId&&x.driverId===u.id);if(!v)return error(r,403,'Vehicle not assigned to you');if(!['in','out'].includes(b.action))return error(r,400,'Action must be in or out');v.onDuty=b.action==='in';v.status=v.onDuty?'On duty':'Off duty';v.clockInAt=v.onDuty?now():null;if(!v.onDuty){v.location=null;v.updatedAt=null;v.trackingEnabled=false;}log('clock_'+b.action,u,{vehicleId:v.id});save();return out(r,200,{vehicle:vehicleView(v)})}
-if(p==='/api/location'&&m==='POST'){if(u.role!=='driver')return error(r,403,'Driver only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.vehicleId&&x.driverId===u.id);if(!v||!v.onDuty||!v.trackingEnabled)return error(r,403,'Clock in and start tracking first');let lat=Number(b.lat),lng=Number(b.lng);if(!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180)return error(r,400,'Invalid GPS location');v.location={lat,lng};v.updatedAt=now();v.accuracy=Number(b.accuracy)||null;v.status=['En route','At station','Idle','Breakdown'].includes(b.status)?b.status:'En route';save();return out(r,200,{ok:true,time:v.updatedAt})}
+if(p==='/api/location'&&m==='POST'){if(u.role!=='driver')return error(r,403,'Driver only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.vehicleId&&x.driverId===u.id);if(!v||!v.onDuty||!v.trackingEnabled)return error(r,403,'Clock in and start tracking first');let lat=Number(b.lat),lng=Number(b.lng);if(!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180)return error(r,400,'Invalid GPS location');v.location={lat,lng};v.updatedAt=now();v.accuracy=Number(b.accuracy)||null;if(Number.isFinite(v.accuracy)&&v.accuracy>=0&&v.accuracy<=50000)recordPosition(v,u,lat,lng,v.accuracy);v.status=['En route','At station','Idle','Breakdown'].includes(b.status)?b.status:'En route';save();return out(r,200,{ok:true,time:v.updatedAt})}
 if(p==='/api/tracking'&&m==='POST'){if(u.role!=='driver')return error(r,403,'Driver only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.vehicleId&&x.driverId===u.id);if(!v||!v.onDuty)return error(r,403,'Clock in first');v.trackingEnabled=b.enabled===true;if(!v.trackingEnabled){v.location=null;v.updatedAt=null;}log('tracking_'+(v.trackingEnabled?'start':'stop'),u,{vehicleId:v.id});save();return out(r,200,{vehicle:vehicleView(v)})}
 if(p==='/api/driver-link/create'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager only');let b=await body(req),v=db.vehicles.find(x=>x.id===b.vehicleId);if(!v||!v.driverId)return error(r,400,'Assign a driver first');db.driverLinks=db.driverLinks.filter(x=>x.vehicleId!==v.id);let secret=crypto.randomBytes(32).toString('base64url'),expiryHours=Math.min(24,Math.max(1,Number(b.hours)||8));db.driverLinks.push({vehicleId:v.id,driverId:v.driverId,hash:crypto.createHash('sha256').update(secret).digest('hex'),expires:new Date(Date.now()+expiryHours*3600000).toISOString()});log('driver_link_create',u,{vehicleId:v.id,expiryHours});save();return out(r,200,{path:'/driver.html#token='+secret,expires:db.driverLinks.at(-1).expires})}
 if(p==='/api/driver-link/revoke'&&m==='POST'){if(!['manager','superadmin'].includes(u.role))return error(r,403,'Manager only');let b=await body(req);db.driverLinks=db.driverLinks.filter(x=>x.vehicleId!==b.vehicleId);log('driver_link_revoke',u,{vehicleId:b.vehicleId});save();return out(r,200,{ok:true})}
